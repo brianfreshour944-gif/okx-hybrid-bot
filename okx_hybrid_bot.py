@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# OKX HYBRID TRADING BOT
+# ALPACA HYBRID TRADING BOT (Crypto Spot)
 
 import asyncio
-import ccxt.pro as ccxtpro
 import pandas as pd
 import numpy as np
 import logging
@@ -10,32 +9,38 @@ import os
 import csv
 from datetime import datetime
 
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# CSV LOGGING
+# CSV LOGGING (same as original)
 # ==============================================================================
 
-def write_trade(symbol, side, price, pnl_usdt=None, total_pnl=None, score=None):
+def write_trade(symbol, side, price, pnl_usd=None, total_pnl=None, score=None):
     with open('trades.csv', 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             symbol, side, price,
-            pnl_usdt if pnl_usdt is not None else '',
+            pnl_usd if pnl_usd is not None else '',
             total_pnl if total_pnl is not None else '',
             score if score is not None else ''
         ])
 
-# Initialize CSV with headers
 if not os.path.exists('trades.csv'):
     with open('trades.csv', 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Timestamp', 'Symbol', 'Side', 'Price', 'PnL_USDT', 'Total_PnL_USDT', 'Score'])
+        writer.writerow(['Timestamp', 'Symbol', 'Side', 'Price', 'PnL_USD', 'Total_PnL_USD', 'Score'])
 
 # ==============================================================================
-# SCORE CALCULATOR
+# SCORE CALCULATOR (unchanged from OKX version)
 # ==============================================================================
 
 class ScoreCalculator:
@@ -107,80 +112,209 @@ class ScoreCalculator:
         return max(0.0, min(1.0, score))
 
 # ==============================================================================
-# BOT
+# ALPACA TRADING BOT (spot only, paper trading)
 # ==============================================================================
 
-class TradingBot:
+class AlpacaTradingBot:
     def __init__(self):
         self.buy_threshold = 0.51
         self.sell_threshold = 0.49
-        self.position_size = 0.01
-        self.symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
+        self.position_size_usd = 10.0          # Each buy order uses this amount (in USD)
+        self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD']   # Alpaca crypto spot pairs
+        
         self.score_calc = ScoreCalculator()
-        self.positions = {}
+        self.positions = {}          # stores entry price for each symbol
         self.total_pnl = 0.0
         
-        self.api_key = os.getenv("OKX_API_KEY", "")
-        self.secret = os.getenv("OKX_SECRET_KEY", "")
-        self.passphrase = os.getenv("OKX_PASSPHRASE", "")
+        # Alpaca API keys (paper trading)
+        self.api_key = os.getenv("APCA_API_KEY_ID", "")
+        self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
         
-        logger.info("Bot initialized")
+        if not self.api_key or not self.secret_key:
+            logger.warning("Alpaca API keys missing. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY.")
+        
+        # Clients (trading is synchronous, we'll run it in threads)
+        self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True)
+        self.data_client = CryptoHistoricalDataClient()
+        
+        logger.info("Alpaca bot initialized (paper trading, crypto spot)")
     
-    async def fetch_data(self, exchange, symbol):
+    # --------------------------------------------------------------------------
+    # Helper: normalise symbol for Alpaca (e.g., "BTC/USD" -> "BTCUSD")
+    # --------------------------------------------------------------------------
+    def _norm_symbol(self, symbol):
+        return symbol.replace("/", "")
+    
+    # --------------------------------------------------------------------------
+    # Fetch latest price + 100 bars (5m interval)
+    # --------------------------------------------------------------------------
+    async def fetch_data(self, symbol):
         try:
-            ticker = await exchange.watch_ticker(symbol)
-            price = ticker['last']
-            ohlcv = await exchange.fetch_ohlcv(symbol, '5m', limit=100)
-            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-            return symbol, price, df
+            # Use synchronous data client in a thread to avoid blocking
+            loop = asyncio.get_running_loop()
+            
+            # Request 100 5-minute bars
+            request = CryptoBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                limit=100
+            )
+            bars = await loop.run_in_executor(None, self.data_client.get_crypto_bars, request)
+            
+            if symbol not in bars.data:
+                return None, None
+            
+            bars_list = bars.data[symbol]
+            # Convert to DataFrame
+            df = pd.DataFrame({
+                'close': [b.close for b in bars_list],
+                'volume': [b.volume for b in bars_list]
+            })
+            current_price = bars_list[-1].close
+            return current_price, df
         except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
-            return symbol, None, None
+            logger.error(f"Data fetch error for {symbol}: {e}")
+            return None, None
     
-    async def run(self):
-        exchange = ccxtpro.okx({
-            'apiKey': self.api_key,
-            'secret': self.secret,
-            'password': self.passphrase,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
+    # --------------------------------------------------------------------------
+    # Get current positions from Alpaca (to know if we hold the asset)
+    # --------------------------------------------------------------------------
+    async def get_positions_cache(self):
+        try:
+            loop = asyncio.get_running_loop()
+            positions = await loop.run_in_executor(None, self.trading_client.get_all_positions)
+            cache = {}
+            for p in positions:
+                # Alpaca returns symbol like "BTCUSD" for BTC/USD
+                cache[p.symbol] = {
+                    'qty': float(p.qty),
+                    'avg_price': float(p.avg_entry_price)
+                }
+            return cache
+        except Exception as e:
+            logger.error(f"Failed to get positions: {e}")
+            return {}
+    
+    # --------------------------------------------------------------------------
+    # Place a market order (buy or sell)
+    # --------------------------------------------------------------------------
+    async def submit_order(self, symbol, side, usd_amount=None):
+        try:
+            loop = asyncio.get_running_loop()
+            norm = self._norm_symbol(symbol)
+            
+            if side == 'buy':
+                # Need to calculate quantity based on current price
+                price, _ = await self.fetch_data(symbol)
+                if price is None:
+                    return False, 0, 0
+                qty = round((usd_amount / price) - 0.0000005, 6)   # small safety subtraction
+                if qty <= 0:
+                    logger.error(f"Calculated qty <= 0 for {symbol} buy")
+                    return False, 0, 0
+                order = MarketOrderRequest(
+                    symbol=norm,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC
+                )
+            else:  # sell
+                positions = await self.get_positions_cache()
+                if norm not in positions:
+                    logger.error(f"No position to sell for {symbol}")
+                    return False, 0, 0
+                qty = positions[norm]['qty']
+                qty = round(qty - 0.0000005, 6)
+                if qty <= 0:
+                    qty = positions[norm]['qty']
+                order = MarketOrderRequest(
+                    symbol=norm,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC
+                )
+            
+            # Submit order (synchronous, wrapped in thread)
+            await loop.run_in_executor(None, self.trading_client.submit_order, order)
+            logger.info(f"Order placed: {side.upper()} {qty} {symbol}")
+            
+            # Get fill price (approx = current market price)
+            fill_price, _ = await self.fetch_data(symbol)
+            if fill_price is None:
+                fill_price = price if side == 'buy' else 0
+            
+            return True, qty, fill_price
         
-        exchange.set_sandbox_mode(True)
+        except Exception as e:
+            logger.error(f"Order failed for {symbol} {side}: {e}")
+            return False, 0, 0
+    
+    # --------------------------------------------------------------------------
+    # Main loop (polls every 5 minutes, same as original)
+    # --------------------------------------------------------------------------
+    async def run(self):
         logger.info("=" * 50)
-        logger.info("PAPER TRADING MODE - OKX HYBRID BOT")
+        logger.info("PAPER TRADING MODE - ALPACA HYBRID BOT (Crypto Spot)")
         logger.info(f"Buy when score > {self.buy_threshold}")
         logger.info(f"Sell when score < {self.sell_threshold}")
         logger.info("=" * 50)
         
-        await exchange.load_markets()
-        
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(300)   # 5 minutes
             
-            tasks = [self.fetch_data(exchange, s) for s in self.symbols]
+            # Fetch data for all symbols concurrently
+            tasks = [self.fetch_data(s) for s in self.symbols]
             results = await asyncio.gather(*tasks)
             
-            for symbol, price, df in results:
+            # Also get current positions once per cycle
+            positions_cache = await self.get_positions_cache()
+            
+            for i, symbol in enumerate(self.symbols):
+                price, df = results[i]
                 if price is None or df is None:
                     continue
                 
                 score = self.score_calc.compute(df)
-                logger.info(f"{symbol} | ${price:.2f} | Score: {score:.3f}")
+                norm = self._norm_symbol(symbol)
+                has_position = norm in positions_cache
                 
-                if score > self.buy_threshold and symbol not in self.positions:
-                    logger.info(f"🟢 BUY: {symbol} @ ${price:.2f}")
-                    write_trade(symbol, 'BUY', price, score=score)
-                    self.positions[symbol] = {'price': price}
+                logger.info(f"{symbol} | ${price:.2f} | Score: {score:.3f} | Position: {has_position}")
                 
-                elif score < self.sell_threshold and symbol in self.positions:
-                    entry = self.positions[symbol]['price']
-                    pnl = (price - entry) / entry * 10.0
-                    self.total_pnl += pnl
-                    logger.info(f"🔴 SELL: {symbol} @ ${price:.2f} | PnL: ${pnl:.2f} | Total: ${self.total_pnl:.2f}")
-                    write_trade(symbol, 'SELL', price, pnl, self.total_pnl, score)
-                    del self.positions[symbol]
+                # --- SELL logic ---
+                if has_position and score < self.sell_threshold:
+                    logger.info(f"🔴 SELL signal for {symbol} @ ${price:.2f}")
+                    entry_price = positions_cache[norm]['avg_price']
+                    qty = positions_cache[norm]['qty']
+                    pnl_usd = (price - entry_price) * qty
+                    self.total_pnl += pnl_usd
+                    
+                    success, fill_qty, fill_price = await self.submit_order(symbol, 'sell')
+                    if success:
+                        write_trade(symbol, 'SELL', fill_price, pnl_usd, self.total_pnl, score)
+                        if symbol in self.positions:
+                            del self.positions[symbol]
+                    else:
+                        logger.error(f"Sell order failed for {symbol}")
+                
+                # --- BUY logic ---
+                elif not has_position and score > self.buy_threshold:
+                    logger.info(f"🟢 BUY signal for {symbol} @ ${price:.2f}")
+                    success, fill_qty, fill_price = await self.submit_order(symbol, 'buy', self.position_size_usd)
+                    if success:
+                        write_trade(symbol, 'BUY', fill_price, score=score)
+                        self.positions[symbol] = {'price': fill_price}
+                    else:
+                        logger.error(f"Buy order failed for {symbol}")
+        
+        # (loop never ends unless interrupted)
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
 
 if __name__ == "__main__":
-    bot = TradingBot()
-    asyncio.run(bot.run())
+    bot = AlpacaTradingBot()
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
