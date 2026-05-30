@@ -1,19 +1,15 @@
-
 #!/usr/bin/env python3
-# ALPACA HYBRID TRADING BOT (Crypto Spot) — Final version
+# ALPACA HYBRID TRADING BOT (Crypto Spot) — Fixed version
 #
-# Parameters found via 3,456-combination grid search on 90 days of real data.
-# Tested with realistic Alpaca spreads (BTC 0.03%, ETH 0.05%, SOL 0.08%).
-# Result: 56.4% win rate, 312 trades/90days, profitable after all costs.
-#
-# Key changes vs the original:
-#   1. Cycle: 5 min → 1 HOUR  (signal noise drops dramatically on hourly bars)
-#   2. Buy threshold: 0.51 → 0.63
-#   3. Sell signal: 0.49 → score < 0.38 for 1 bar (no need for 2 with hourly)
-#   4. Stop loss:   entry - 2.5 × ATR  (was 1.5×, too tight for hourly bars)
-#   5. Take profit: entry + 4.0 × ATR  (was 2.5×, giving 1.6:1 R:R)
-#   6. Min hold: 4 hourly bars before signal exits allowed
-#   7. ScoreCalculator logic unchanged — feeds hourly OHLCV bars now
+# Fixes vs previous version:
+#   1. ATR now uses proper True Range (needs high/low bars)
+#   2. Cooldown only applied after LOSS exits, not all exits
+#   3. Fill price captured from order response, not next bar fetch
+#   4. P&L calculated from actual fill price, not bar close
+#   5. Position size raised to $100 minimum (fees math)
+#   6. Score bias clarified: z-score mean-reversion + trend filter
+#      now applied sequentially, not additively canceling each other
+#   7. Added proper high/low to data fetch for real ATR
 
 import asyncio
 import pandas as pd
@@ -69,79 +65,108 @@ def write_trade(symbol, side, price, qty=None, pnl_usd=None, total_pnl=None,
         ])
 
 # ==============================================================================
-# SCORE CALCULATOR  (unchanged from your original)
+# SCORE CALCULATOR
 # ==============================================================================
 
 class ScoreCalculator:
-    def __init__(self):
-        self.score_history = []
 
     def rsi(self, prices, period=14):
         if len(prices) < period + 1:
             return 50
-        deltas = np.diff(prices[-period-1:])
+        deltas = np.diff(prices[-period - 1:])
         gain = np.mean(deltas[deltas > 0]) if any(deltas > 0) else 0.001
         loss = -np.mean(deltas[deltas < 0]) if any(deltas < 0) else 0.001
         return 100 - (100 / (1 + (gain / loss)))
 
     def ema(self, prices, period):
         alpha = 2 / (period + 1)
-        ema = np.zeros_like(prices)
+        ema = np.zeros_like(prices, dtype=float)
         ema[0] = prices[0]
         for i in range(1, len(prices)):
-            ema[i] = prices[i] * alpha + ema[i-1] * (1 - alpha)
+            ema[i] = prices[i] * alpha + ema[i - 1] * (1 - alpha)
         return ema
 
     def compute(self, df):
         if df is None or len(df) < 50:
             return 0.5
 
-        close  = df['close'].values
-        volume = df['volume'].values
+        close  = df['close'].values.astype(float)
+        volume = df['volume'].values.astype(float)
 
         ma20  = np.mean(close[-20:])
         std20 = np.std(close[-20:])
         z_score = (close[-1] - ma20) / std20 if std20 > 0 else 0
 
-        rsi_val = self.rsi(close)
-        ema9    = self.ema(close, 9)
-        ema21   = self.ema(close, 21)
+        rsi_val  = self.rsi(close)
+        ema9     = self.ema(close, 9)
+        ema21    = self.ema(close, 21)
         is_uptrend = ema9[-1] > ema21[-1] and close[-1] > ema9[-1]
 
         vol_avg   = np.mean(volume[-10:]) if len(volume) >= 10 else 1
         vol_surge = volume[-1] / vol_avg if vol_avg > 0 else 1
 
+        # FIX: score bias was conflicting.
+        # Mean-reversion signal: buy dips (z < 0) that are also in uptrend.
+        # If NOT in uptrend, only trade stronger dips (z < -1.5) as reversal plays.
         score = 0.5
 
-        if z_score < -1.2:   score += 0.35
-        elif z_score < -0.8: score += 0.25
-        elif z_score < -0.4: score += 0.15
-        elif z_score > 1.2:  score -= 0.35
-        elif z_score > 0.8:  score -= 0.25
-        elif z_score > 0.4:  score -= 0.15
+        if is_uptrend:
+            # Trend-following dip buy: standard thresholds
+            if z_score < -1.2:   score += 0.35
+            elif z_score < -0.8: score += 0.25
+            elif z_score < -0.4: score += 0.15
+            elif z_score > 1.2:  score -= 0.25  # overbought in uptrend — smaller penalty
+            elif z_score > 0.8:  score -= 0.15
+            elif z_score > 0.4:  score -= 0.08
+            # Trend bonus
+            score += 0.08
+        else:
+            # Not in uptrend — only enter on strong mean-reversion dips
+            if z_score < -1.5:   score += 0.25
+            elif z_score < -1.0: score += 0.10
+            elif z_score > 0.8:  score -= 0.30  # aggressively penalise overbought downtrend
+            elif z_score > 0.4:  score -= 0.20
 
+        # RSI overlay (same in both branches)
         if rsi_val < 35:   score += 0.10
         elif rsi_val < 45: score += 0.05
         elif rsi_val > 65: score -= 0.10
         elif rsi_val > 55: score -= 0.05
 
-        if is_uptrend and score > 0.5:
-            score += 0.08
-
+        # Volume surge: only helps if score is already bullish
         if vol_surge > 1.3:
             score += 0.05 if score > 0.5 else -0.05
 
         return max(0.0, min(1.0, score))
 
 # ==============================================================================
-# ATR helper
+# ATR helper — FIX: proper True Range using high/low
 # ==============================================================================
 
-def calc_atr(close_arr, period=14):
-    """Average True Range from close-to-close moves."""
-    if len(close_arr) < period + 1:
-        return close_arr[-1] * 0.001
-    return float(np.mean(np.abs(np.diff(close_arr[-(period + 1):]))))
+def calc_atr(df, period=14):
+    """
+    True ATR: max(high-low, |high-prev_close|, |low-prev_close|)
+    Falls back to close-to-close if high/low not available.
+    """
+    if df is None or len(df) < period + 1:
+        return df['close'].iloc[-1] * 0.01
+
+    if 'high' in df.columns and 'low' in df.columns:
+        high  = df['high'].values.astype(float)
+        low   = df['low'].values.astype(float)
+        close = df['close'].values.astype(float)
+        tr = np.maximum(
+            high[1:] - low[1:],
+            np.maximum(
+                np.abs(high[1:] - close[:-1]),
+                np.abs(low[1:]  - close[:-1])
+            )
+        )
+        return float(np.mean(tr[-period:]))
+    else:
+        # Fallback: close-to-close (less accurate)
+        close = df['close'].values.astype(float)
+        return float(np.mean(np.abs(np.diff(close[-(period + 1):]))))
 
 # ==============================================================================
 # MAIN BOT
@@ -150,23 +175,24 @@ def calc_atr(close_arr, period=14):
 class AlpacaTradingBot:
 
     def __init__(self):
-        # STRATEGY THRESHOLDS — from 3,456-combo grid search on 90 days hourly data
-        # Best combo: 56.4% win rate, 312 trades/90d, profitable after spread costs
-        self.buy_threshold     = 0.63   # entry when score exceeds this
-        self.sell_threshold    = 0.38   # exit signal when score drops below this
-        self.min_hold_bars     = 4      # never exit on signal before 4 hourly bars
-        self.sell_confirm_bars = 1      # 1 bar below sell_threshold is enough (hourly = less noise)
+        self.buy_threshold     = 0.63
+        self.sell_threshold    = 0.38
+        self.min_hold_bars     = 4
+        self.sell_confirm_bars = 1
 
-        # POSITION SIZING & RISK
-        self.position_size_usd  = 10.0   # increase to $100+ for larger absolute returns
-        self.atr_stop_mult      = 2.5    # stop loss  = entry - ATR × 2.5 (wider than 5-min bot)
-        self.atr_target_mult    = 4.0    # take profit = entry + ATR × 4.0  (1.6:1 R:R)
-        self.daily_loss_limit   = -30.0
-        self.max_daily_trades   = 10     # ~3.5 trades/day across 3 symbols on hourly bars
+        # FIX: raise minimum position size — $10 is eaten by spreads.
+        # At 0.05% spread on ETH, round-trip cost = 0.10% = $0.10 on $100.
+        # On $10 that's $0.01 — tiny, but wins need to be proportionally larger too.
+        # Real issue: absolute P&L is tiny at $10 even with good % returns.
+        self.position_size_usd  = 100.0   # was $10 — adjust to your comfort level
+
+        self.atr_stop_mult      = 2.5
+        self.atr_target_mult    = 4.0
+        self.daily_loss_limit   = -50.0   # scaled with larger position size
+        self.max_daily_trades   = 10
 
         self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 
-        # API
         self.api_key    = os.getenv("APCA_API_KEY_ID", "")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
 
@@ -178,14 +204,13 @@ class AlpacaTradingBot:
 
         self.score_calc = ScoreCalculator()
 
-        # Runtime state
-        self.positions   = {}   # symbol → {entry_price, stop_price, target_price, bars_held, score}
-        self.cooldowns   = {}
-        self.bearish_count = {}  # consecutive bars below sell_threshold per symbol
-        self.total_pnl       = 0.0
-        self.daily_pnl       = 0.0
+        self.positions         = {}
+        self.cooldowns         = {}
+        self.bearish_count     = {}
+        self.total_pnl         = 0.0
+        self.daily_pnl         = 0.0
         self.daily_trade_count = 0
-        self.current_day     = datetime.now().date()
+        self.current_day       = datetime.now().date()
 
         init_csv()
         self.load_state()
@@ -257,7 +282,7 @@ class AlpacaTradingBot:
             return {}
 
     # ==========================================================================
-    # DATA
+    # DATA — FIX: now fetches high/low for proper ATR
     # ==========================================================================
 
     async def fetch_data(self, symbol):
@@ -265,7 +290,7 @@ class AlpacaTradingBot:
             loop = asyncio.get_running_loop()
             req  = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
-                timeframe=TimeFrame(1, TimeFrameUnit.Hour),   # hourly bars — backtest basis
+                timeframe=TimeFrame(1, TimeFrameUnit.Hour),
                 limit=100,
             )
             bars = await loop.run_in_executor(
@@ -275,6 +300,9 @@ class AlpacaTradingBot:
                 return None, None
             rows = bars.data[symbol]
             df = pd.DataFrame({
+                'open':   [b.open   for b in rows],
+                'high':   [b.high   for b in rows],
+                'low':    [b.low    for b in rows],
                 'close':  [b.close  for b in rows],
                 'volume': [b.volume for b in rows],
             })
@@ -284,22 +312,33 @@ class AlpacaTradingBot:
             return None, None
 
     # ==========================================================================
-    # ORDERS
+    # ORDERS — FIX: capture fill price from the order response
     # ==========================================================================
 
     async def submit_order(self, symbol, side, usd_amount=None):
+        """
+        Returns (success: bool, qty: float, fill_price: float)
+
+        FIX: previously fetched a new bar after the order to get 'fill price'
+        which is actually the NEXT bar's open — wrong for P&L tracking.
+        We now use avg_entry_price from the order/position response.
+        If that's unavailable (market order latency), we fall back to the
+        pre-order quote, which is much closer than the next bar fetch.
+        """
         try:
             loop = asyncio.get_running_loop()
             norm = self._norm(symbol)
 
+            # Pre-order quote for sizing and fallback fill price
+            pre_price, _ = await self.fetch_data(symbol)
+            if pre_price is None:
+                return False, 0, 0
+
             if side == 'buy':
-                price, _ = await self.fetch_data(symbol)
-                if price is None:
-                    return False, 0, 0
-                qty = round((usd_amount / price) - 0.0000005, 6)
+                qty = round((usd_amount / pre_price) - 0.0000005, 6)
                 if qty <= 0:
                     return False, 0, 0
-                order = MarketOrderRequest(
+                order_req = MarketOrderRequest(
                     symbol=norm, qty=qty,
                     side=OrderSide.BUY, time_in_force=TimeInForce.GTC
                 )
@@ -311,15 +350,25 @@ class AlpacaTradingBot:
                 qty = round(positions[norm]['qty'] - 0.0000005, 6)
                 if qty <= 0:
                     qty = positions[norm]['qty']
-                order = MarketOrderRequest(
+                order_req = MarketOrderRequest(
                     symbol=norm, qty=qty,
                     side=OrderSide.SELL, time_in_force=TimeInForce.GTC
                 )
 
-            await loop.run_in_executor(None, self.trading_client.submit_order, order)
-            fill_price, _ = await self.fetch_data(symbol)
+            order = await loop.run_in_executor(
+                None, self.trading_client.submit_order, order_req
+            )
+
+            # Try to get fill price from the order object; fall back to pre-order price
+            fill_price = pre_price
+            try:
+                if order.filled_avg_price is not None:
+                    fill_price = float(order.filled_avg_price)
+            except Exception:
+                pass
+
             logger.info(f"ORDER {side.upper()} {qty} {symbol} @ ~${fill_price:.4f}")
-            return True, qty, fill_price or 0
+            return True, qty, fill_price
 
         except Exception as e:
             logger.error(f"Order failed {symbol} {side}: {e}")
@@ -331,32 +380,28 @@ class AlpacaTradingBot:
 
     async def run(self):
         logger.info("=" * 60)
-        logger.info("PAPER TRADING — ALPACA HYBRID BOT (Final / Hourly)")
-        logger.info(f"  Cycle:          1-hour bars (backtest-validated)")
+        logger.info("PAPER TRADING — ALPACA HYBRID BOT (Fixed / Hourly)")
         logger.info(f"  Buy threshold:  >{self.buy_threshold}")
         logger.info(f"  Sell threshold: <{self.sell_threshold} ({self.sell_confirm_bars} bar confirm)")
         logger.info(f"  Min hold:       {self.min_hold_bars} hours before signal exit")
         logger.info(f"  Stop loss:      ATR × {self.atr_stop_mult}")
         logger.info(f"  Take profit:    ATR × {self.atr_target_mult}  (1.6:1 R:R)")
         logger.info(f"  Position size:  ${self.position_size_usd:.0f}/trade")
-        logger.info(f"  Backtest edge:  56.4% win rate, 312 trades/90d, profitable")
         logger.info("=" * 60)
 
         last_heartbeat = 0
 
         while True:
             try:
-                # Heartbeat every 30s
-                now = time.time()
-                if now - last_heartbeat >= 30:
+                now_t = time.time()
+                if now_t - last_heartbeat >= 30:
                     logger.info(
                         f"[Heartbeat] Open positions: {len(self.positions)} | "
                         f"Daily P&L: ${self.daily_pnl:.2f} | "
                         f"Total P&L: ${self.total_pnl:.2f}"
                     )
-                    last_heartbeat = now
+                    last_heartbeat = now_t
 
-                # Reset daily counters at midnight
                 today = datetime.now().date()
                 if today != self.current_day:
                     logger.info("New trading day — resetting daily counters.")
@@ -364,21 +409,18 @@ class AlpacaTradingBot:
                     self.daily_trade_count = 0
                     self.current_day       = today
 
-                # Daily loss guard
                 if self.daily_pnl <= self.daily_loss_limit:
                     logger.error(f"Daily loss limit hit (${self.daily_pnl:.2f}) — pausing until midnight.")
                     await asyncio.sleep(60)
                     continue
 
-                await asyncio.sleep(3600)   # 1-hour cycle — matches hourly-bar backtest
+                await asyncio.sleep(3600)
 
-                # Fetch data for all symbols concurrently
                 results = await asyncio.gather(*[self.fetch_data(s) for s in self.symbols])
                 positions_cache = await self.get_positions_cache()
 
                 for i, symbol in enumerate(self.symbols):
                     try:
-                        # Cooldown check
                         if symbol in self.cooldowns:
                             if datetime.now() < self.cooldowns[symbol]:
                                 continue
@@ -388,12 +430,10 @@ class AlpacaTradingBot:
                         if price is None or df is None:
                             continue
 
-                        score     = self.score_calc.compute(df)
-                        close_arr = df['close'].values
-                        norm      = self._norm(symbol)
-                        has_pos   = norm in positions_cache
+                        score = self.score_calc.compute(df)
+                        norm  = self._norm(symbol)
+                        has_pos = norm in positions_cache
 
-                        # Track consecutive bearish bars per symbol
                         if score < self.sell_threshold:
                             self.bearish_count[symbol] = self.bearish_count.get(symbol, 0) + 1
                         else:
@@ -416,14 +456,9 @@ class AlpacaTradingBot:
                             target_price = pos_data.get('target_price', entry_price * 1.08)
                             bars_held    = pos_data.get('bars_held',    0)
 
-                            pnl_pct = (price - entry_price) / entry_price
-                            pnl_usd = (price - entry_price) * qty
-
-                            # Increment hold counter
                             if symbol in self.positions:
                                 self.positions[symbol]['bars_held'] = bars_held + 1
 
-                            # Determine exit reason
                             exit_reason = None
                             if price <= stop_price:
                                 exit_reason = "STOP_LOSS"
@@ -434,15 +469,16 @@ class AlpacaTradingBot:
                                 exit_reason = "SIGNAL_EXIT"
 
                             logger.info(
-                                f"  Tracking {symbol} | P&L {pnl_pct*100:.2f}% | "
-                                f"SL ${stop_price:.4f} | TP ${target_price:.4f} | "
-                                f"bars {bars_held}"
+                                f"  Tracking {symbol} | SL ${stop_price:.4f} | "
+                                f"TP ${target_price:.4f} | bars {bars_held}"
                             )
 
                             if exit_reason:
                                 logger.info(f"  EXIT {symbol} — {exit_reason}")
                                 success, fill_qty, fill_price = await self.submit_order(symbol, 'sell')
                                 if success:
+                                    # FIX: P&L from actual fill price, not bar close
+                                    pnl_usd = (fill_price - entry_price) * fill_qty
                                     self.total_pnl         += pnl_usd
                                     self.daily_pnl         += pnl_usd
                                     self.daily_trade_count += 1
@@ -454,7 +490,13 @@ class AlpacaTradingBot:
                                     if symbol in self.positions:
                                         del self.positions[symbol]
                                     self.bearish_count[symbol] = 0
-                                    self.cooldowns[symbol] = datetime.now() + timedelta(hours=6)
+
+                                    # FIX: cooldown only on LOSS exits — profit exits allow re-entry
+                                    if exit_reason == "STOP_LOSS":
+                                        self.cooldowns[symbol] = datetime.now() + timedelta(hours=6)
+                                        logger.info(f"  Cooldown set for {symbol} (6h, loss exit)")
+                                    else:
+                                        logger.info(f"  No cooldown — {exit_reason} allows re-entry")
 
                         # ==================================================
                         # LOOK FOR NEW ENTRY
@@ -464,7 +506,7 @@ class AlpacaTradingBot:
                                 continue
 
                             if score > self.buy_threshold:
-                                atr          = calc_atr(close_arr, 14)
+                                atr          = calc_atr(df, 14)
                                 stop_price   = price - atr * self.atr_stop_mult
                                 target_price = price + atr * self.atr_target_mult
 
@@ -484,12 +526,13 @@ class AlpacaTradingBot:
                                     )
                                     self.daily_trade_count += 1
                                     self.bearish_count[symbol] = 0
-                                    self.cooldowns[symbol] = datetime.now() + timedelta(hours=6)
+                                    # FIX: no cooldown on BUY — only on loss exit
                                     self.positions[symbol] = {
-                                        'entry_time':  datetime.now().isoformat(),
-                                        'stop_price':  stop_price,
+                                        'entry_time':   datetime.now().isoformat(),
+                                        'entry_price':  fill_price,  # store for reference
+                                        'stop_price':   stop_price,
                                         'target_price': target_price,
-                                        'bars_held':   0,
+                                        'bars_held':    0,
                                     }
 
                         self.save_state()
